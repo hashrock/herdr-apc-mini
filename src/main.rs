@@ -55,7 +55,8 @@ struct Fleet {
     /// simplify を済ませた時点の HEAD。
     simplified: Simplified,
     /// simplify を投入して、まだ終わっていないワークスペース。
-    pending_simplify: HashMap<String, ()>,
+    /// デーモンの再起動を跨いでも失われないようファイルにも置く。
+    pending_simplify: Vec<String>,
 }
 
 impl Fleet {
@@ -294,7 +295,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         panes: HashMap::new(),
         reasons: HashMap::new(),
         simplified: verbs::load_simplified(),
-        pending_simplify: HashMap::new(),
+        pending_simplify: verbs::load_pending(),
     };
     fleet.seed(&agents);
     fleet.render(&mut surface);
@@ -476,8 +477,9 @@ fn on_pad(surface: &mut Surface, fleet: &mut Fleet, slot: usize, held_soft: Opti
         json!({ "target": target, "text": verb.prompt() }),
     ) {
         Ok(_) => {
-            if verb == Verb::Simplify {
-                fleet.pending_simplify.insert(ws, ());
+            if verb == Verb::Simplify && !fleet.pending_simplify.contains(&ws) {
+                fleet.pending_simplify.push(ws);
+                verbs::save_pending(&fleet.pending_simplify);
             }
         }
         Err(e) => eprintln!("{} の投入に失敗: {e}", verb.label()),
@@ -506,7 +508,7 @@ fn redraw(surface: &mut Surface, fleet: &Fleet, held: Option<usize>) {
 fn settle_simplify(fleet: &mut Fleet) {
     let done: Vec<String> = fleet
         .pending_simplify
-        .keys()
+        .iter()
         .filter(|ws| matches!(fleet.status_of(ws), Some(Status::Idle) | Some(Status::Done)))
         .cloned()
         .collect();
@@ -515,13 +517,14 @@ fn settle_simplify(fleet: &mut Fleet) {
     }
     let cwds = workspace_cwds();
     for ws in done {
-        fleet.pending_simplify.remove(&ws);
+        fleet.pending_simplify.retain(|w| w != &ws);
         let Some(cwd) = cwds.get(&ws) else { continue };
         let Some(head) = git::head(cwd) else { continue };
         eprintln!("simplify 済みとして記録します: {ws} @ {head}");
         verbs::save_simplified(&ws, &head);
         fleet.simplified.insert(ws, head);
     }
+    verbs::save_pending(&fleet.pending_simplify);
     fleet.reasons = verbs::scan(&cwds, &fleet.simplified);
 }
 

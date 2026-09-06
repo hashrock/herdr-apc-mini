@@ -43,6 +43,7 @@ AKAI APC mini mk2 を [herdr](https://github.com/hashrock/herdr) の物理コン
 
 simplify の記録は config-dir の `simplify.json`。**投入時ではなく、相手が手を止めた
 時点の HEAD** を記録する（「済み」は終わった時点のコードに対して成り立つため）。
+記録待ちは `pending.json` に置くので、デーモンを再起動しても失われない。
 
 git の状態は herdr のイベントに現れないので、30 秒ごとにポーリングする。
 

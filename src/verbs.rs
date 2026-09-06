@@ -99,6 +99,27 @@ pub fn save_simplified(ws: &str, head: &str) {
     }
 }
 
+/// simplify を投入して、まだ終わっていないワークスペース。
+///
+/// デーモンが落ちても記録待ちを失わないよう、メモリだけでなくファイルにも置く。
+pub fn load_pending() -> Vec<String> {
+    let path = crate::padmap::config_dir().join("pending.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_pending(pending: &[String]) {
+    let dir = crate::padmap::config_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(body) = serde_json::to_string(pending) {
+        let _ = std::fs::write(dir.join("pending.json"), format!("{body}\n"));
+    }
+}
+
 /// 各ワークスペースの理由を git から作る。`cwds` は workspace_id -> 作業ディレクトリ。
 pub fn scan(cwds: &HashMap<String, String>, simplified: &Simplified) -> HashMap<String, Reasons> {
     let mut out = HashMap::new();
