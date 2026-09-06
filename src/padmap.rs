@@ -1,8 +1,9 @@
 //! パッドとワークスペースの対応。
 //!
 //! 8x8 を丸ごと状態表示に使い、**左上から詰める**。
-//! 枠が勝手に動くと筋肉記憶が壊れるので、一度決めた割り当ては永続化する。
-//! ワークスペースが消えても**穴を空けたまま**にし、新しいものは空き枠の末尾へ入れる。
+//! 並び順は永続化するので、開いている限り枠は動かない。
+//! ワークスペースが閉じたらその枠は消し、**以降を前へ寄せる**。死んだ枠が
+//! 生きた枠と同じ見た目で盤面に残るほうが困る、という判断。
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -49,25 +50,86 @@ pub fn save(slots: &[Option<String>]) {
     let _ = std::fs::write(path(), format!("{body:#}\n"));
 }
 
-/// 既存の割り当てを保ったまま、まだ載っていないワークスペースを空き列へ入れる。
+/// 生きているワークスペースだけを、今の並び順のまま左上から詰め直す。
 ///
-/// `preferred` を先に詰めるので、初回はエージェントのいるものが前に来る。
-/// 二回目以降は保存済みの割り当てが優先され、順序は動かない。
+/// 閉じたものは枠ごと消え、以降が前へ寄る。まだ載っていないものは末尾へ足す。
+/// `preferred` を先に見るので、初回はエージェントのいるものが前に来る。
 pub fn assign(
     slots: &mut Vec<Option<String>>,
     preferred: &[String],
     rest: &[String],
 ) -> bool {
-    let mut changed = false;
-    for id in preferred.iter().chain(rest.iter()) {
-        if slots.iter().any(|c| c.as_deref() == Some(id.as_str())) {
-            continue;
+    let live: Vec<&String> = preferred.iter().chain(rest.iter()).collect();
+    let mut next: Vec<Option<String>> = Vec::with_capacity(SLOTS);
+    // 保存ファイルが壊れていて同じ id が二度出ても、枠を二重に食わせない。
+    fn push(next: &mut Vec<Option<String>>, id: &str) {
+        if next.iter().flatten().any(|k| k == id) {
+            return;
         }
-        let Some(slot) = slots.iter_mut().find(|c| c.is_none()) else {
-            break; // 64 枠すべて埋まっている
-        };
-        *slot = Some(id.clone());
-        changed = true;
+        next.push(Some(id.to_string()));
     }
+    // 既に載っているものは今の順番を保つ。閉じたものはここで落ちる。
+    for id in slots.iter().flatten() {
+        if live.iter().any(|l| *l == id) {
+            push(&mut next, id);
+        }
+    }
+    // まだ載っていないものを末尾へ。
+    for id in live {
+        push(&mut next, id);
+    }
+    next.truncate(SLOTS);
+    next.resize(SLOTS, None);
+    let changed = *slots != next;
+    *slots = next;
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn placed(slots: &[Option<String>]) -> Vec<&str> {
+        slots.iter().flatten().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn 閉じたワークスペースの枠は消えて以降が前へ寄る() {
+        let mut slots = vec![None; SLOTS];
+        assign(&mut slots, &[], &ids(&["a", "b", "c", "d"]));
+        assert_eq!(placed(&slots), ["a", "b", "c", "d"]);
+
+        assert!(assign(&mut slots, &[], &ids(&["a", "b", "d"])));
+        assert_eq!(placed(&slots), ["a", "b", "d"]);
+    }
+
+    #[test]
+    fn 開いたままなら順番は動かない() {
+        let mut slots = vec![None; SLOTS];
+        assign(&mut slots, &[], &ids(&["a", "b", "c"]));
+        // 一覧の順が変わっても、既に載っているものは今の並びを保つ。
+        assert!(!assign(&mut slots, &[], &ids(&["c", "b", "a"])));
+        assert_eq!(placed(&slots), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn 新しいワークスペースは末尾へ足す() {
+        let mut slots = vec![None; SLOTS];
+        assign(&mut slots, &[], &ids(&["a", "b"]));
+        assert!(assign(&mut slots, &ids(&["z"]), &ids(&["a", "b"])));
+        assert_eq!(placed(&slots), ["a", "b", "z"]);
+    }
+
+    #[test]
+    fn 六十四枠を超えたぶんは載らない() {
+        let all: Vec<String> = (0..SLOTS + 3).map(|i| format!("w{i}")).collect();
+        let mut slots = vec![None; SLOTS];
+        assign(&mut slots, &[], &all);
+        assert_eq!(slots.len(), SLOTS);
+        assert_eq!(placed(&slots).len(), SLOTS);
+    }
 }

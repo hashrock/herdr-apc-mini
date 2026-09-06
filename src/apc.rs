@@ -145,6 +145,9 @@ impl Surface {
         if self.shadow[note as usize] == want {
             return;
         }
+        if std::env::var("APC_DEBUG").is_ok() {
+            eprintln!("lamp note={note} {lamp:?}");
+        }
         let _ = self.out.send(&[0x90, note, lamp.velocity()]);
         self.shadow[note as usize] = want;
     }

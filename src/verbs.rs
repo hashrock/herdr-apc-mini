@@ -11,13 +11,15 @@ use crate::git;
 pub enum Verb {
     Simplify,
     SyncRemote,
+    /// PR を作る／既にあればコメントを取りにいく。押した先の状態で文言が変わる。
+    Pr,
 }
 
 /// 右列の上から順。空きは `None`。
 pub const SOFT_KEYS: [Option<Verb>; 8] = [
     Some(Verb::Simplify),
     Some(Verb::SyncRemote),
-    None,
+    Some(Verb::Pr),
     None,
     None,
     None,
@@ -27,10 +29,15 @@ pub const SOFT_KEYS: [Option<Verb>; 8] = [
 
 impl Verb {
     /// agent に投入する文言。
-    pub fn prompt(self) -> &'static str {
+    ///
+    /// PR は「まだ無いなら作る、もうあるなら見にいく」で文言が変わるので、
+    /// そのワークスペースの理由を見て決める。
+    pub fn prompt(self, reasons: &Reasons) -> &'static str {
         match self {
             Verb::Simplify => "/simplify",
             Verb::SyncRemote => "リモートと同期して",
+            Verb::Pr if reasons.has_pr => "PRコメントを取得",
+            Verb::Pr => "PR作成",
         }
     }
 
@@ -38,15 +45,35 @@ impl Verb {
         match self {
             Verb::Simplify => "simplify",
             Verb::SyncRemote => "sync remote",
+            Verb::Pr => "PR",
         }
     }
 }
+
+/// 下段ボタンの割り当て。左から順、空きは `None`。
+///
+/// soft key と違って宛先を選ばない。**フォーカス中の agent** にそのまま送る、
+/// 会話の相づちのようなもの。`(ログに出す名前, 送る文言)`。
+pub const TRACK_KEYS: [Option<(&str, &str)>; 8] = [
+    Some(("ok", "OK")),
+    Some(("推奨案", "推奨案で進めて")),
+    Some(("かみくだく", "中学生にわかるように解説")),
+    Some(("長い", "長い")),
+    None,
+    None,
+    None,
+    None,
+];
 
 /// そのワークスペースに、どの動詞の理由があるか。
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Reasons {
     pub simplify: bool,
     pub sync_remote: bool,
+    /// GitHub のリポジトリか。PR ボタンが意味を持つ条件。
+    pub github: bool,
+    /// 今のブランチに PR があるか。PR ボタンの文言がこれで変わる。
+    pub has_pr: bool,
 }
 
 impl Reasons {
@@ -54,6 +81,7 @@ impl Reasons {
         match verb {
             Verb::Simplify => self.simplify,
             Verb::SyncRemote => self.sync_remote,
+            Verb::Pr => self.github,
         }
     }
 }
@@ -125,12 +153,16 @@ pub fn scan(cwds: &HashMap<String, String>, simplified: &Simplified) -> HashMap<
     let mut out = HashMap::new();
     for (ws, cwd) in cwds {
         let Some(head) = git::head(cwd) else { continue };
+        let github = git::has_github_remote(cwd);
         out.insert(
             ws.clone(),
             Reasons {
                 // 記録が無い（未実施）か、記録した時点から HEAD が進んでいる（陳腐化）
                 simplify: simplified.get(ws) != Some(&head),
                 sync_remote: git::diverged_from_upstream(cwd),
+                github,
+                // gh はネットワークに出るので、GitHub のリポジトリにだけ聞く。
+                has_pr: github && git::has_pr(cwd),
             },
         );
     }

@@ -19,7 +19,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use padmap::SLOTS;
-use verbs::{Reasons, Simplified, Verb, SOFT_KEYS};
+use verbs::{Reasons, Simplified, Verb, SOFT_KEYS, TRACK_KEYS};
 
 /// 発火したことを目で分かるようにする白フラッシュの長さ。
 const FLASH: Duration = Duration::from_millis(120);
@@ -123,11 +123,19 @@ impl Fleet {
         self.panes.get(pane).map(|(_, st)| *st)
     }
 
-    /// 下段の LED。宛先がある間だけ点灯する。
+    /// 下段の LED。割り当てのあるボタンを、宛先がある間だけ点ける。
     fn render_track_keys(&self, surface: &mut Surface) {
-        let lamp = if self.focused_status().is_some() { Lamp::On } else { Lamp::Off };
-        surface.set_lamp(apc::TRACK_LEFT, lamp);
-        surface.set_lamp(apc::TRACK_LEFT + 1, lamp);
+        let lit = self.focused_status().is_some();
+        for (i, key) in TRACK_KEYS.iter().enumerate() {
+            let note = apc::TRACK_LEFT + i as u8;
+            let lamp = if lit && key.is_some() { Lamp::On } else { Lamp::Off };
+            surface.set_lamp(note, lamp);
+        }
+    }
+
+    /// そのワークスペースの理由。まだ git を見ていなければ「理由なし」。
+    fn reasons_of(&self, workspace_id: &str) -> Reasons {
+        self.reasons.get(workspace_id).copied().unwrap_or_default()
     }
 }
 
@@ -422,22 +430,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if let Some(i) = soft_index(note) {
                     held_soft = Some(i);
                     redraw(&mut surface, &fleet, held_soft);
-                } else if note == apc::TRACK_LEFT {
-                    // Volume = OK。フォーカス中のエージェントに "OK" を送る。
+                } else if let Some((label, text)) = track_key(note) {
+                    // 下段はフォーカス中のエージェントへの相づち。宛先は選ばない。
                     lamp_flash(&mut surface, note, &fleet, held_soft);
-                    act_on_focused("ok", |target| {
+                    act_on_focused(label, |target| {
                         herdr::request(
                             "agent.prompt",
-                            json!({ "target": target, "text": "OK" }),
-                        )
-                    });
-                } else if note == apc::TRACK_LEFT + 1 {
-                    // Pan = 推奨案で進めて。
-                    lamp_flash(&mut surface, note, &fleet, held_soft);
-                    act_on_focused("推奨案", |target| {
-                        herdr::request(
-                            "agent.prompt",
-                            json!({ "target": target, "text": "推奨案で進めて" }),
+                            json!({ "target": target, "text": text }),
                         )
                     });
                 }
@@ -496,6 +495,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 下段ボタンの note なら、そこに割り当てた（名前, 送る文言）。
+fn track_key(note: u8) -> Option<(&'static str, &'static str)> {
+    let i = note.checked_sub(apc::TRACK_LEFT)? as usize;
+    TRACK_KEYS.get(i).copied().flatten()
+}
+
 /// 右列 soft key の note なら、上から数えた番号。
 fn soft_index(note: u8) -> Option<usize> {
     (note >= apc::SCENE_TOP && note < apc::SCENE_TOP + 8)
@@ -527,11 +532,9 @@ fn on_pad(surface: &mut Surface, fleet: &mut Fleet, slot: usize, held_soft: Opti
         return;
     };
     flash(surface, note, fleet, held_soft);
-    eprintln!("{}: {ws} へ投入します", verb.label());
-    match herdr::request(
-        "agent.prompt",
-        json!({ "target": target, "text": verb.prompt() }),
-    ) {
+    let text = verb.prompt(&fleet.reasons_of(&ws));
+    eprintln!("{}: {ws} へ「{text}」を投入します", verb.label());
+    match herdr::request("agent.prompt", json!({ "target": target, "text": text })) {
         Ok(_) => {
             if verb == Verb::Simplify && !fleet.pending_simplify.contains(&ws) {
                 fleet.pending_simplify.push(ws);
