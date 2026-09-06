@@ -2,8 +2,6 @@
 
 AKAI APC mini mk2 を [herdr](https://github.com/hashrock/herdr) の物理コンソールにする plugin。
 
-設計は司令塔リポジトリの `pilot/missions/apc-mini-mk2.md` にある。
-
 ## 現状
 
 **最下段（フェーダーの真上）にプロジェクトの状態ランプ**を描き、その行だけ入力を受け付ける。

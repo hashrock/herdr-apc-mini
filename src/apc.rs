@@ -128,6 +128,9 @@ impl Surface {
         if self.shadow[note as usize] == want {
             return;
         }
+        if std::env::var("APC_DEBUG").is_ok() {
+            eprintln!("pad note={note} color={color} ch={ch}");
+        }
         let _ = self.out.send(&[0x90 | ch, note, color]);
         self.shadow[note as usize] = want;
     }
