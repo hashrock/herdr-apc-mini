@@ -25,11 +25,20 @@ use verbs::{Reasons, Simplified, Verb, SOFT_KEYS};
 const FLASH: Duration = Duration::from_millis(120);
 /// git の状態を見にいく間隔。herdr のイベントでは分からないのでここだけポーリング。
 const GIT_POLL: Duration = Duration::from_secs(30);
+/// エージェントの状態を見にいく間隔。
+///
+/// herdr は「どのペインでもいいから状態が変わった」というイベントを持たない
+/// （`pane.agent_status_changed` は購読にペインを 1 つ指定する形）。
+/// `pane.updated` は状態変化では飛んでこないことがあるので、艦隊ぜんぶを見る
+/// この盤面では問い合わせのほうを主にする。
+const AGENT_POLL: Duration = Duration::from_secs(1);
 
 /// main のループが捌くイベント。MIDI と socket を一本に合流させる。
 pub enum Ev {
     Pad(Pad),
     Herdr(Value),
+    /// `agent.list` を引いた結果。
+    Agents(Value),
     /// git を見て回った結果。
     Reasons(HashMap<String, Reasons>),
     Closed,
@@ -57,6 +66,8 @@ struct Fleet {
     /// simplify を投入して、まだ終わっていないワークスペース。
     /// デーモンの再起動を跨いでも失われないようファイルにも置く。
     pending_simplify: Vec<String>,
+    /// herdr が今フォーカスしているペイン。下段ボタンの宛先になる。
+    focused_pane: Option<String>,
 }
 
 impl Fleet {
@@ -103,16 +114,32 @@ impl Fleet {
             surface.set_lamp(note, lamp);
         }
     }
+
+    /// フォーカス中のペインにいるエージェントの状態。いなければ `None`。
+    ///
+    /// 下段ボタンは「フォーカス中の agent へ送る」ので、これが宛先の有無に等しい。
+    fn focused_status(&self) -> Option<Status> {
+        let pane = self.focused_pane.as_ref()?;
+        self.panes.get(pane).map(|(_, st)| *st)
+    }
+
+    /// 下段の LED。宛先がある間だけ点灯する。
+    fn render_track_keys(&self, surface: &mut Surface) {
+        let lamp = if self.focused_status().is_some() { Lamp::On } else { Lamp::Off };
+        surface.set_lamp(apc::TRACK_LEFT, lamp);
+        surface.set_lamp(apc::TRACK_LEFT + 1, lamp);
+    }
 }
 
 impl Fleet {
-    /// `agent.list` の内容で状態を作り直す。
+    /// `agent.list` の内容で状態を作り直す。描き直しが要るかを返す。
     ///
     /// `pane.updated` の購読は直後に全ペインをリプレイしてくれるが、
     /// そこに載る `agent_status` は `unknown` なので、実際の idle / blocked は
-    /// この問い合わせでしか分からない。
-    fn seed(&mut self, agents: &Value) {
-        self.panes.clear();
+    /// この問い合わせでしか分からない。フォーカスも同じくここから拾う。
+    fn seed(&mut self, agents: &Value) -> bool {
+        let mut panes = HashMap::new();
+        let mut focused = None;
         for a in agents["agents"].as_array().map(|v| v.as_slice()).unwrap_or(&[]) {
             let (Some(pane_id), Some(ws)) = (
                 a.get("pane_id").and_then(|v| v.as_str()),
@@ -123,8 +150,15 @@ impl Fleet {
             let status = Status::parse(
                 a.get("agent_status").and_then(|v| v.as_str()).unwrap_or("unknown"),
             );
-            self.panes.insert(pane_id.to_string(), (ws.to_string(), status));
+            panes.insert(pane_id.to_string(), (ws.to_string(), status));
+            if a.get("focused").and_then(|v| v.as_bool()).unwrap_or(false) {
+                focused = Some(pane_id.to_string());
+            }
         }
+        let changed = panes != self.panes || focused != self.focused_pane;
+        self.panes = panes;
+        self.focused_pane = focused;
+        changed
     }
 
     /// そのワークスペースで一番手が要るエージェントのペイン。
@@ -296,10 +330,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reasons: HashMap::new(),
         simplified: verbs::load_simplified(),
         pending_simplify: verbs::load_pending(),
+        focused_pane: None,
     };
     fleet.seed(&agents);
-    fleet.render(&mut surface);
-    fleet.render_soft_keys(&mut surface, None);
+    redraw(&mut surface, &fleet, None);
 
     let (tx, rx) = mpsc::channel::<Ev>();
     let _midi = input::listen(tx.clone())?;
@@ -346,6 +380,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 状態とフォーカスは問い合わせで拾う。イベントだけでは取りこぼす。
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || loop {
+            match herdr::request("agent.list", json!({})) {
+                Ok(v) => {
+                    if tx.send(Ev::Agents(v)).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => eprintln!("agent.list に失敗: {e}"),
+            }
+            std::thread::sleep(AGENT_POLL);
+        });
+    }
+
     // git は herdr のイベントに現れないので、ここだけ定期的に見にいく。
     {
         let tx = tx.clone();
@@ -373,17 +423,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     held_soft = Some(i);
                     redraw(&mut surface, &fleet, held_soft);
                 } else if note == apc::TRACK_LEFT {
-                    // Volume = OK。フォーカス中のエージェントに Enter を送る。
-                    lamp_flash(&mut surface, note);
+                    // Volume = OK。フォーカス中のエージェントに "OK" を送る。
+                    lamp_flash(&mut surface, note, &fleet, held_soft);
                     act_on_focused("ok", |target| {
                         herdr::request(
-                            "agent.send_keys",
-                            json!({ "target": target, "keys": ["enter"] }),
+                            "agent.prompt",
+                            json!({ "target": target, "text": "OK" }),
                         )
                     });
                 } else if note == apc::TRACK_LEFT + 1 {
                     // Pan = 推奨案で進めて。
-                    lamp_flash(&mut surface, note);
+                    lamp_flash(&mut surface, note, &fleet, held_soft);
                     act_on_focused("推奨案", |target| {
                         herdr::request(
                             "agent.prompt",
@@ -422,6 +472,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         settle_simplify(&mut fleet);
                         redraw(&mut surface, &fleet, held_soft);
                     }
+                }
+            }
+            Ev::Agents(agents) => {
+                if fleet.seed(&agents) {
+                    settle_simplify(&mut fleet);
+                    redraw(&mut surface, &fleet, held_soft);
                 }
             }
             Ev::Reasons(reasons) => {
@@ -500,6 +556,7 @@ fn redraw(surface: &mut Surface, fleet: &Fleet, held: Option<usize>) {
         None => fleet.render(surface),
     }
     fleet.render_soft_keys(surface, held);
+    fleet.render_track_keys(surface);
 }
 
 /// simplify を投げた相手が idle/done に戻ったら、その時点の HEAD を記録する。
@@ -546,11 +603,14 @@ fn workspace_cwds() -> HashMap<String, String> {
     out
 }
 
-/// 単色 LED のボタンを一瞬光らせる。
-fn lamp_flash(surface: &mut Surface, note: u8) {
-    surface.set_lamp(note, Lamp::On);
+/// 下段のボタンを一瞬だけ反転させて、押したことを見せる。
+///
+/// 点いているものを光らせても分からないので、消えるほうへ振る。
+fn lamp_flash(surface: &mut Surface, note: u8, fleet: &Fleet, held: Option<usize>) {
+    let lit = fleet.focused_status().is_some();
+    surface.set_lamp(note, if lit { Lamp::Off } else { Lamp::On });
     std::thread::sleep(FLASH);
-    surface.set_lamp(note, Lamp::Off);
+    redraw(surface, fleet, held);
 }
 
 /// フォーカス中のエージェントに対して何かする。

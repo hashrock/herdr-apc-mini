@@ -20,10 +20,20 @@ AKAI APC mini mk2 を [herdr](https://github.com/hashrock/herdr) の物理コン
 |---|---|
 | パッド単押し | `workspace.focus` — そのワークスペースへ飛ぶ |
 | **右列を押しながらパッド** | その動詞をそのワークスペースで実行 |
-| Volume (下段 1) | フォーカス中の agent へ **Enter**（`agent.send_keys`） |
+| Volume (下段 1) | フォーカス中の agent へ **「OK」**（`agent.prompt`） |
 | Pan (下段 2) | フォーカス中の agent へ「推奨案で進めて」（`agent.prompt`） |
 
 発火時は白フラッシュ、撃てないときは赤フラッシュ。長押しは使わない。
+
+### 下段 Volume / Pan = 「宛先」のランプ
+
+どちらも**フォーカス中の agent** に送るので、送り先があるときだけ点灯する。
+
+- 点灯 = herdr がフォーカスしているペインに agent がいる（押せば届く）
+- 消灯 = agent のいないペインにフォーカスしている（押しても何も起きない）
+
+フォーカスの移動は `pane.updated` には現れないので、`pane.focused` を購読して追う。
+押したときは点いていれば一瞬消し、消えていれば一瞬点けて、押したことを見せる。
 
 ### 右列 soft key = 「余地」のランプ
 
