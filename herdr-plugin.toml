@@ -1,0 +1,12 @@
+id = "apc-mini"
+name = "APC mini bridge"
+version = "0.1.0"
+min_herdr_version = "0.0.0"
+description = "AKAI APC mini mk2 を herdr の物理コンソールにする"
+platforms = ["macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[startup]]
+command = ["./target/release/apcd"]
