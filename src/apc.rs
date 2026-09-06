@@ -84,11 +84,23 @@ impl Lamp {
     }
 }
 
-/// 設計上の行番号（0 = 一番上）を note 番号に変換する。
+/// 左上から数えた通し番号を note 番号に変換する。
 ///
 /// 実機は note 0 が左下なので上下が反転する。
-pub fn pad_note(row: u8, col: u8) -> u8 {
-    (7 - row) * 8 + col
+pub fn pad_note(slot: usize) -> u8 {
+    let row = slot / 8;
+    let col = slot % 8;
+    ((7 - row) * 8 + col) as u8
+}
+
+/// note 番号を左上から数えた通し番号に戻す。パッド以外なら `None`。
+pub fn pad_slot(note: u8) -> Option<usize> {
+    if note >= 64 {
+        return None;
+    }
+    let row = 7 - (note / 8);
+    let col = note % 8;
+    Some((row * 8 + col) as usize)
 }
 
 pub struct Surface {
