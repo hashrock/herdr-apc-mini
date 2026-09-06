@@ -32,6 +32,8 @@ const GIT_POLL: Duration = Duration::from_secs(30);
 /// `pane.updated` は状態変化では飛んでこないことがあるので、艦隊ぜんぶを見る
 /// この盤面では問い合わせのほうを主にする。
 const AGENT_POLL: Duration = Duration::from_secs(1);
+/// 実機の抜き差しを見にいく間隔。
+const MIDI_POLL: Duration = Duration::from_secs(2);
 
 /// main のループが捌くイベント。MIDI と socket を一本に合流させる。
 pub enum Ev {
@@ -39,6 +41,9 @@ pub enum Ev {
     Herdr(Value),
     /// `agent.list` を引いた結果。
     Agents(Value),
+    /// 実機の様子。`present` は今そこにあるか、`changed` は MIDI の構成が
+    /// 変わったか（速い抜き差しは `present` には現れない）。
+    Midi { present: bool, changed: bool },
     /// git を見て回った結果。
     Reasons(HashMap<String, Reasons>),
     Closed,
@@ -326,9 +331,14 @@ fn flash(surface: &mut Surface, note: u8, fleet: &Fleet, held: Option<usize>) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut surface = Surface::open()?;
-    surface.clear_all();
-    eprintln!("APC mini mk2 に接続しました");
+    // 実機が無くてもデーモンは動かす。挿されたところで繋ぎにいく。
+    let mut surface = Surface::new();
+    if surface.connect() {
+        surface.clear_all();
+        eprintln!("APC mini mk2 に接続しました");
+    } else {
+        eprintln!("APC mini mk2 が見つかりません。挿されるまで待ちます");
+    }
 
     let mut slots = padmap::load();
     let agents = sync_slots(&mut slots)?;
@@ -344,8 +354,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     redraw(&mut surface, &fleet, None);
 
     let (tx, rx) = mpsc::channel::<Ev>();
-    let _midi = input::listen(tx.clone())?;
-    eprintln!("盤面の入力を受け付けます");
+    // 実機と一緒に付け外しするので、掴んだままにできるよう持っておく。
+    let mut midi_in = surface.connected().then(|| listen_pads(&tx, true)).flatten();
+
+    // 抜き差しの見張り。ポートの有無をそのまま流し、判断は main 側でやる。
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            apc::watch_ports(MIDI_POLL, |present, changed| {
+                tx.send(Ev::Midi { present, changed }).is_ok()
+            });
+        });
+    }
 
     // 購読は別スレッドで回し、届いたものをチャンネルへ流す。
     {
@@ -479,6 +499,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     redraw(&mut surface, &fleet, held_soft);
                 }
             }
+            Ev::Midi { present, changed } => {
+                // 見張りスレッドが見たものを、こちらのスレッドにも反映させる。
+                apc::pump();
+                if !present {
+                    if surface.connected() {
+                        eprintln!("APC mini mk2 が抜かれました。挿されるまで待ちます");
+                        surface.disconnect();
+                        // 掴んだままだと挿し直したときに購読が二重になる。
+                        drop(midi_in.take());
+                    }
+                    continue;
+                }
+                if changed && surface.connected() {
+                    // 見張りの間隔より速い抜き差しは、有無の変化としては見えない。
+                    // 実機は消灯して戻ってくるので、繋ぎ直して丸ごと描き直す。
+                    surface.disconnect();
+                    drop(midi_in.take());
+                }
+                if !surface.connected() {
+                    if surface.connect() {
+                        eprintln!("APC mini mk2 に接続しました");
+                        surface.clear_all();
+                        held_soft = None;
+                        redraw(&mut surface, &fleet, held_soft);
+                        midi_in = listen_pads(&tx, true);
+                    }
+                } else if midi_in.is_none() {
+                    // 出力ポートだけ先に見えることがある。入力は黙って試し続ける。
+                    midi_in = listen_pads(&tx, false);
+                }
+            }
             Ev::Reasons(reasons) => {
                 if fleet.reasons != reasons {
                     fleet.reasons = reasons;
@@ -493,6 +544,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// パッドの入力を受け取り始める。実機が無い・掴めないなら `None`。
+///
+/// `loud` は失敗を報せるかどうか。繋いだ直後の 1 回だけ報せ、その後の
+/// 試し直しは黙らせる（2 秒ごとに同じ行を並べても仕方がない）。
+fn listen_pads(tx: &mpsc::Sender<Ev>, loud: bool) -> Option<input::Connection> {
+    match input::listen(tx.clone()) {
+        Ok(conn) => {
+            eprintln!("盤面の入力を受け付けます");
+            Some(conn)
+        }
+        Err(e) => {
+            if loud {
+                eprintln!("盤面の入力を受け取れません: {e}");
+            }
+            None
+        }
+    }
 }
 
 /// 下段ボタンの note なら、そこに割り当てた（名前, 送る文言）。

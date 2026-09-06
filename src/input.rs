@@ -15,7 +15,10 @@ pub enum Pad {
     Up(u8),
 }
 
-pub fn listen(tx: Sender<crate::Ev>) -> Result<MidiInputConnection<()>, Box<dyn std::error::Error>> {
+/// 掴んでいるあいだだけ入力が届く。落とすと購読が終わる。
+pub type Connection = MidiInputConnection<()>;
+
+pub fn listen(tx: Sender<crate::Ev>) -> Result<Connection, Box<dyn std::error::Error>> {
     let mut mi = MidiInput::new("herdr-apc-mini-in")?;
     mi.ignore(Ignore::None);
     let port = mi

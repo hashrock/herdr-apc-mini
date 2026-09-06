@@ -11,6 +11,8 @@
 //!   フェーダー     CC 0x30-0x37 (48-55)、CC 0x38 (56) = マスター
 
 use midir::{MidiOutput, MidiOutputConnection};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub const PORT_NAME: &str = "APC mini mk2 Control";
 
@@ -103,22 +105,157 @@ pub fn pad_slot(note: u8) -> Option<usize> {
     Some((row * 8 + col) as usize)
 }
 
+/// 盤面が今どこにも繋がっていないことを表す影の値。実在しない色・チャンネル。
+const UNKNOWN: (u8, u8) = (255, 255);
+
+/// 抜き差しを見張り続ける。`report(ポートがあるか, 構成が変わったか)` を呼び、
+/// `false` が返ったら終わる。**必ず専用スレッドで呼ぶこと**（run loop を回すため）。
+///
+/// CoreMIDI のポート一覧は**プロセス内にキャッシュ**されていて、run loop を
+/// 回さない限り更新されない。クライアントを作り直しても駄目で、素直に sleep で
+/// 待つと挿し直しに永久に気づけない（仮想ポートを出して確かめた）。
+///
+/// 有無を見るだけだと、**間隔より速い抜き差しを取りこぼす**。抜けたことに
+/// 気づかないまま繋がっている扱いが続き、実機は消灯しているのに差分しか
+/// 送られない。そこで構成変更の通知も一緒に見る。
+pub fn watch_ports(interval: Duration, mut report: impl FnMut(bool, bool) -> bool) {
+    // 通知の宛先になるクライアント。run loop を回すこのスレッドで作る。
+    let _notify = notify_client();
+    loop {
+        if !report(port_present(), took_change()) {
+            return;
+        }
+        wait(interval);
+    }
+}
+
+/// 構成が変わった、という印。通知スレッドが立て、見張りが降ろす。
+static CHANGED: AtomicBool = AtomicBool::new(false);
+
+fn took_change() -> bool {
+    CHANGED.swap(false, Ordering::Relaxed)
+}
+
+/// 構成変更を受け取るクライアント。**掴んだままにしないと通知が来ない。**
+#[cfg(target_os = "macos")]
+fn notify_client() -> Option<coremidi::Client> {
+    coremidi::Client::new_with_notifications("herdr-apc-mini-watch", |n: &coremidi::Notification| {
+        if matches!(n, coremidi::Notification::SetupChanged) {
+            CHANGED.store(true, Ordering::Relaxed);
+        }
+    })
+    .map_err(|e| eprintln!("MIDI の構成変更を受け取れません: {e}"))
+    .ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn notify_client() -> Option<()> {
+    None
+}
+
+fn port_present() -> bool {
+    let Ok(mo) = MidiOutput::new("herdr-apc-mini-probe") else {
+        return false;
+    };
+    mo.ports()
+        .iter()
+        .any(|p| mo.port_name(p).map(|n| n == PORT_NAME).unwrap_or(false))
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFRunLoopDefaultMode: *const std::ffi::c_void;
+    fn CFRunLoopRunInMode(mode: *const std::ffi::c_void, seconds: f64, after: u8) -> i32;
+}
+
+/// 溜まっている CoreMIDI の通知を、このスレッドで捌く。
+///
+/// **キャッシュはスレッドごと**で、run loop を回したスレッドしか更新されない。
+/// 見張りスレッドがポートの出現に気づいても、`connect` するスレッドが古い一覧を
+/// 見ていたら繋げない。繋ぎにいく前にここを通すこと。
+#[cfg(target_os = "macos")]
+pub fn pump() {
+    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 0) };
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn pump() {}
+
+/// CoreMIDI の通知を受け取りながら待つ。
+#[cfg(target_os = "macos")]
+fn wait(dur: Duration) {
+    let start = Instant::now();
+    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, dur.as_secs_f64(), 0) };
+    // ソースが無いと即返る。空回りさせないよう、残りは素直に寝る。
+    if let Some(rest) = dur.checked_sub(start.elapsed()) {
+        std::thread::sleep(rest);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn wait(dur: Duration) {
+    std::thread::sleep(dur);
+}
+
 pub struct Surface {
-    out: MidiOutputConnection,
+    /// 繋がっていなければ `None`。抜かれているあいだは何も送らない。
+    out: Option<MidiOutputConnection>,
     /// 送信済みの状態。差分だけ送るために持つ。
     shadow: [(u8, u8); 128],
 }
 
 impl Surface {
-    pub fn open() -> Result<Self, Box<dyn std::error::Error>> {
-        let mo = MidiOutput::new("herdr-apc-mini")?;
-        let port = mo
+    /// まだ繋いでいない盤面。実機が無くてもデーモンは動く。
+    pub fn new() -> Self {
+        Surface { out: None, shadow: [UNKNOWN; 128] }
+    }
+
+    pub fn connected(&self) -> bool {
+        self.out.is_some()
+    }
+
+    /// ポートを探して繋ぐ。繋げたら `true`。
+    ///
+    /// 実機は抜かれているあいだに消灯しているので、影は必ず捨てる。
+    /// そうしないと「前回と同じ」と判断して描き直しを飛ばしてしまう。
+    pub fn connect(&mut self) -> bool {
+        let Ok(mo) = MidiOutput::new("herdr-apc-mini") else {
+            return false;
+        };
+        let Some(port) = mo
             .ports()
             .into_iter()
             .find(|p| mo.port_name(p).map(|n| n == PORT_NAME).unwrap_or(false))
-            .ok_or_else(|| format!("MIDI ポート {PORT_NAME} が見つかりません"))?;
-        let out = mo.connect(&port, "herdr-apc-mini")?;
-        Ok(Surface { out, shadow: [(255, 255); 128] })
+        else {
+            return false;
+        };
+        let Ok(out) = mo.connect(&port, "herdr-apc-mini") else {
+            return false;
+        };
+        self.out = Some(out);
+        self.shadow = [UNKNOWN; 128];
+        true
+    }
+
+    pub fn disconnect(&mut self) {
+        self.out = None;
+        self.shadow = [UNKNOWN; 128];
+    }
+
+    /// 1 メッセージ送る。送れたら `true`。
+    ///
+    /// 失敗は抜かれたものとして扱う。挿し直しは見張り側が拾う。
+    fn send(&mut self, msg: &[u8]) -> bool {
+        let Some(out) = self.out.as_mut() else {
+            return false;
+        };
+        if out.send(msg).is_err() {
+            eprintln!("盤面への送信に失敗しました。抜かれたものとして扱います");
+            self.disconnect();
+            return false;
+        }
+        true
     }
 
     /// パッド 1 枚を塗る。前回と同じなら送らない。
@@ -131,8 +268,9 @@ impl Surface {
         if std::env::var("APC_DEBUG").is_ok() {
             eprintln!("pad note={note} color={color} ch={ch}");
         }
-        let _ = self.out.send(&[0x90 | ch, note, color]);
-        self.shadow[note as usize] = want;
+        if self.send(&[0x90 | ch, note, color]) {
+            self.shadow[note as usize] = want;
+        }
     }
 
     pub fn off(&mut self, note: u8) {
@@ -148,8 +286,9 @@ impl Surface {
         if std::env::var("APC_DEBUG").is_ok() {
             eprintln!("lamp note={note} {lamp:?}");
         }
-        let _ = self.out.send(&[0x90, note, lamp.velocity()]);
-        self.shadow[note as usize] = want;
+        if self.send(&[0x90, note, lamp.velocity()]) {
+            self.shadow[note as usize] = want;
+        }
     }
 
     pub fn clear_all(&mut self) {
