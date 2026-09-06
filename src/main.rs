@@ -92,8 +92,8 @@ impl Fleet {
     }
 }
 
-fn load_columns(client: &mut Client) -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
-    let (result, _) = client.request("ws", "workspace.list", serde_json::json!({}))?;
+fn load_columns() -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
+    let result = herdr::request("workspace.list", serde_json::json!({}))?;
     let mut list: Vec<(u64, String, String)> = result["workspaces"]
         .as_array()
         .map(|a| a.as_slice())
@@ -129,9 +129,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     surface.clear_all();
     eprintln!("APC mini mk2 に接続しました");
 
-    let mut client = Client::connect()?;
-    let columns = load_columns(&mut client)?;
+    let columns = load_columns()?;
     let mut fleet = Fleet { columns, panes: HashMap::new() };
+    let mut client = Client::connect()?;
 
     // pane.updated は購読直後に全ペインの現在状態をリプレイしてくれる。
     // 初期化のための snapshot 取得は要らない。
@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(false),
             // 列の顔ぶれが変わったら組み直す
             "workspace_created" | "workspace_closed" => {
-                fleet.columns = load_columns(&mut client)?;
+                fleet.columns = load_columns()?;
                 true
             }
             _ => false,
