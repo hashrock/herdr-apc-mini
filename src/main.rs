@@ -5,6 +5,7 @@
 
 mod apc;
 mod herdr;
+mod padmap;
 
 use apc::{color, Behavior, Surface};
 use herdr::{Client, Status};
@@ -13,16 +14,15 @@ use std::collections::HashMap;
 
 /// 状態ランプを置く行。フェーダーの真上に来るよう最下段に置く。
 const ROW_STATUS: u8 = 7;
-/// 一度に載るプロジェクト数。
-const COLUMNS: usize = 8;
+use padmap::COLUMNS;
 
 fn paint(status: Status) -> (u8, Behavior) {
     match status {
         Status::Blocked => (color::RED, Behavior::Blink),
         Status::Working => (color::ORANGE, Behavior::Pulse),
         Status::Done => (color::GREEN, Behavior::Pulse),
-        Status::Idle => (color::GREEN, Behavior::Dim),
-        Status::Unknown => (color::GREY, Behavior::Dim),
+        Status::Idle => (color::GREEN, Behavior::Half),
+        Status::Unknown => (color::WHITE, Behavior::Dim),
     }
 }
 
@@ -34,6 +34,27 @@ struct Fleet {
 }
 
 impl Fleet {
+    /// `agent.list` の内容で状態を作り直す。
+    ///
+    /// `pane.updated` の購読は直後に全ペインをリプレイしてくれるが、
+    /// そこに載る `agent_status` は `unknown` なので、実際の idle / blocked は
+    /// この問い合わせでしか分からない。
+    fn seed(&mut self, agents: &Value) {
+        self.panes.clear();
+        for a in agents["agents"].as_array().map(|v| v.as_slice()).unwrap_or(&[]) {
+            let (Some(pane_id), Some(ws)) = (
+                a.get("pane_id").and_then(|v| v.as_str()),
+                a.get("workspace_id").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let status = Status::parse(
+                a.get("agent_status").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            );
+            self.panes.insert(pane_id.to_string(), (ws.to_string(), status));
+        }
+    }
+
     fn status_of(&self, workspace_id: &str) -> Option<Status> {
         let mut acc: Option<Status> = None;
         for (ws, st) in self.panes.values() {
@@ -64,6 +85,15 @@ impl Fleet {
         let status = Status::parse(
             pane.get("agent_status").and_then(|v| v.as_str()).unwrap_or("unknown"),
         );
+        // 購読直後のリプレイは agent_status を unknown で寄越す。
+        // 既に確かな状態を持っているペインを、それで塗り潰さない。
+        if status == Status::Unknown {
+            if let Some((_, prev)) = self.panes.get(pane_id) {
+                if *prev != Status::Unknown {
+                    return false;
+                }
+            }
+        }
         let next = (ws, status);
         match self.panes.get(pane_id) {
             Some(prev) if *prev == next => false,
@@ -84,7 +114,7 @@ impl Fleet {
                         surface.set(note, c, b);
                     }
                     // ワークスペースはあるがエージェントがいない
-                    None => surface.set(note, color::GREY, Behavior::Dim),
+                    None => surface.set(note, color::WHITE, Behavior::Dim),
                 },
                 None => surface.off(note),
             }
@@ -92,9 +122,13 @@ impl Fleet {
     }
 }
 
-fn load_columns() -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
+/// ワークスペースの一覧を取り、ピン留めを保ったまま列へ割り当てる。
+/// あわせて `agent.list` の内容を返す。
+fn sync_columns(
+    columns: &mut Vec<Option<String>>,
+) -> Result<Value, Box<dyn std::error::Error>> {
     let result = herdr::request("workspace.list", serde_json::json!({}))?;
-    let mut list: Vec<(u64, String, String)> = result["workspaces"]
+    let mut all: Vec<(u64, String, String)> = result["workspaces"]
         .as_array()
         .map(|a| a.as_slice())
         .unwrap_or(&[])
@@ -107,21 +141,54 @@ fn load_columns() -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
             ))
         })
         .collect();
-    list.sort_by_key(|(n, _, _)| *n);
+    all.sort_by_key(|(n, _, _)| *n);
 
-    let mut columns = vec![None; COLUMNS];
-    for (i, (_, id, label)) in list.iter().take(COLUMNS).enumerate() {
-        eprintln!("col {i}: {id} {label}");
-        columns[i] = Some(id.clone());
+    // 初回に前へ来てほしいのはエージェントが居るワークスペース。
+    let agents = herdr::request("agent.list", serde_json::json!({}))?;
+    let with_agent: Vec<String> = agents["agents"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|a| a.get("workspace_id")?.as_str().map(str::to_string))
+        .collect();
+
+    let preferred: Vec<String> = all
+        .iter()
+        .filter(|(_, id, _)| with_agent.contains(id))
+        .map(|(_, id, _)| id.clone())
+        .collect();
+    let rest: Vec<String> = all
+        .iter()
+        .filter(|(_, id, _)| !with_agent.contains(id))
+        .map(|(_, id, _)| id.clone())
+        .collect();
+
+    if padmap::assign(columns, &preferred, &rest) {
+        padmap::save(columns);
     }
-    if list.len() > COLUMNS {
+
+    let label_of = |id: &str| -> String {
+        all.iter()
+            .find(|(_, w, _)| w == id)
+            .map(|(_, _, l)| l.clone())
+            .unwrap_or_else(|| "(消えたワークスペース)".into())
+    };
+    for (i, slot) in columns.iter().enumerate() {
+        match slot {
+            Some(id) => eprintln!("col {i}: {id} {}", label_of(id)),
+            None => eprintln!("col {i}: (空き)"),
+        }
+    }
+    let placed = columns.iter().filter(|c| c.is_some()).count();
+    if all.len() > placed {
         eprintln!(
-            "note: workspace が {} 個あります。先頭 {} 個だけ載せます（バンク切替は未実装）",
-            list.len(),
-            COLUMNS
+            "note: workspace {} 個のうち {} 個を載せています（バンク切替は未実装）",
+            all.len(),
+            placed
         );
     }
-    Ok(columns)
+    Ok(agents)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -129,8 +196,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     surface.clear_all();
     eprintln!("APC mini mk2 に接続しました");
 
-    let columns = load_columns()?;
+    let mut columns = padmap::load();
+    let agents = sync_columns(&mut columns)?;
     let mut fleet = Fleet { columns, panes: HashMap::new() };
+    fleet.seed(&agents);
+    fleet.render(&mut surface);
     let mut client = Client::connect()?;
 
     // pane.updated は購読直後に全ペインの現在状態をリプレイしてくれる。
@@ -156,7 +226,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(false),
             // 列の顔ぶれが変わったら組み直す
             "workspace_created" | "workspace_closed" => {
-                fleet.columns = load_columns()?;
+                let agents = sync_columns(&mut fleet.columns)?;
+                fleet.seed(&agents);
                 true
             }
             _ => false,
