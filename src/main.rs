@@ -5,15 +5,30 @@
 
 mod apc;
 mod herdr;
+mod input;
 mod padmap;
 
 use apc::{color, Behavior, Surface};
 use herdr::{Client, Status};
-use serde_json::Value;
+use input::Pad;
+use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 /// 状態ランプを置く行。フェーダーの真上に来るよう最下段に置く。
 const ROW_STATUS: u8 = 7;
+/// これ以上押し続けたら長押しとみなす。
+const LONG_PRESS: Duration = Duration::from_millis(800);
+/// 発火したことを目で分かるようにする白フラッシュの長さ。
+const FLASH: Duration = Duration::from_millis(120);
+
+/// main のループが捌くイベント。MIDI と socket を一本に合流させる。
+pub enum Ev {
+    Pad(Pad),
+    Herdr(Value),
+    Closed,
+}
 use padmap::COLUMNS;
 
 fn paint(status: Status) -> (u8, Behavior) {
@@ -53,6 +68,21 @@ impl Fleet {
             );
             self.panes.insert(pane_id.to_string(), (ws.to_string(), status));
         }
+    }
+
+    /// そのワークスペースで一番手が要るエージェントのペイン。
+    fn pane_of(&self, workspace_id: &str) -> Option<String> {
+        let mut best: Option<(&String, Status)> = None;
+        for (pane_id, (ws, st)) in &self.panes {
+            if ws != workspace_id {
+                continue;
+            }
+            best = match best {
+                Some((_, prev)) if prev.max(*st) == prev => best,
+                _ => Some((pane_id, *st)),
+            };
+        }
+        best.map(|(id, _)| id.clone())
     }
 
     fn status_of(&self, workspace_id: &str) -> Option<Status> {
@@ -191,6 +221,19 @@ fn sync_columns(
     Ok(agents)
 }
 
+/// 状態ランプの行の note なら、その列番号。
+fn status_column(note: u8) -> Option<usize> {
+    (0..COLUMNS)
+        .find(|c| apc::pad_note(ROW_STATUS, *c as u8) == note)
+}
+
+/// 押した瞬間が分かるように白く光らせ、すぐ元の絵に戻す。
+fn flash(surface: &mut Surface, note: u8, fleet: &Fleet) {
+    surface.set(note, color::WHITE, Behavior::Solid);
+    std::thread::sleep(FLASH);
+    fleet.render(surface);
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut surface = Surface::open()?;
     surface.clear_all();
@@ -201,39 +244,142 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fleet = Fleet { columns, panes: HashMap::new() };
     fleet.seed(&agents);
     fleet.render(&mut surface);
-    let mut client = Client::connect()?;
 
-    // pane.updated は購読直後に全ペインの現在状態をリプレイしてくれる。
-    // 初期化のための snapshot 取得は要らない。
-    client.subscribe(&["pane.updated", "pane.closed", "workspace.created", "workspace.closed"])?;
-    eprintln!("herdr のイベントを購読しました");
+    let (tx, rx) = mpsc::channel::<Ev>();
+    let _midi = input::listen(tx.clone())?;
+    eprintln!("盤面の入力を受け付けます");
+
+    // 購読は別スレッドで回し、届いたものをチャンネルへ流す。
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut client = match Client::connect() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("herdr に接続できません: {e}");
+                    let _ = tx.send(Ev::Closed);
+                    return;
+                }
+            };
+            // pane.updated は購読直後に全ペインをリプレイするが、その agent_status は
+            // unknown なので、実状態は起動時の agent.list を種にしてある。
+            if let Err(e) = client.subscribe(&[
+                "pane.updated",
+                "pane.closed",
+                "workspace.created",
+                "workspace.closed",
+            ]) {
+                eprintln!("購読に失敗しました: {e}");
+                let _ = tx.send(Ev::Closed);
+                return;
+            }
+            eprintln!("herdr のイベントを購読しました");
+            loop {
+                match client.next() {
+                    Ok(Some(v)) => {
+                        if tx.send(Ev::Herdr(v)).is_err() {
+                            return;
+                        }
+                    }
+                    _ => {
+                        let _ = tx.send(Ev::Closed);
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    // note -> (押した時刻, 長押しを発火済みか)
+    let mut held: HashMap<u8, (Instant, bool)> = HashMap::new();
 
     loop {
-        let Some(msg) = client.next()? else {
-            eprintln!("herdr との接続が閉じました");
-            break;
-        };
-        let Some(kind) = msg.get("event").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let data = &msg["data"];
-        let dirty = match kind {
-            "pane_updated" => fleet.apply_pane(&data["pane"]),
-            "pane_closed" => data
-                .get("pane_id")
-                .and_then(|v| v.as_str())
-                .map(|id| fleet.panes.remove(id).is_some())
-                .unwrap_or(false),
-            // 列の顔ぶれが変わったら組み直す
-            "workspace_created" | "workspace_closed" => {
-                let agents = sync_columns(&mut fleet.columns)?;
-                fleet.seed(&agents);
-                true
+        // 長押しの判定が要るあいだは、その締め切りまでしか待たない。
+        let wait = held
+            .values()
+            .filter(|(_, fired)| !fired)
+            .map(|(t, _)| LONG_PRESS.saturating_sub(t.elapsed()))
+            .min()
+            .unwrap_or(Duration::from_secs(3600));
+
+        match rx.recv_timeout(wait) {
+            Ok(Ev::Pad(Pad::Down(note))) => {
+                if status_column(note).is_some() {
+                    held.insert(note, (Instant::now(), false));
+                }
             }
-            _ => false,
-        };
-        if dirty {
-            fleet.render(&mut surface);
+            Ok(Ev::Pad(Pad::Up(note))) => {
+                if let Some((at, fired)) = held.remove(&note) {
+                    // 長押しで発火済みなら、離しでは何もしない。
+                    if !fired && at.elapsed() < LONG_PRESS {
+                        if let Some(col) = status_column(note) {
+                            if let Some(Some(ws)) = fleet.columns.get(col) {
+                                let ws = ws.clone();
+                                flash(&mut surface, note, &fleet);
+                                if let Err(e) = herdr::request(
+                                    "workspace.focus",
+                                    json!({ "workspace_id": ws }),
+                                ) {
+                                    eprintln!("workspace.focus に失敗: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Ev::Herdr(msg)) => {
+                if let Some(kind) = msg.get("event").and_then(|v| v.as_str()) {
+                    let data = &msg["data"];
+                    let dirty = match kind {
+                        "pane_updated" => fleet.apply_pane(&data["pane"]),
+                        "pane_closed" => data
+                            .get("pane_id")
+                            .and_then(|v| v.as_str())
+                            .map(|id| fleet.panes.remove(id).is_some())
+                            .unwrap_or(false),
+                        "workspace_created" | "workspace_closed" => {
+                            let agents = sync_columns(&mut fleet.columns)?;
+                            fleet.seed(&agents);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if dirty {
+                        fleet.render(&mut surface);
+                    }
+                }
+            }
+            Ok(Ev::Closed) => {
+                eprintln!("herdr との接続が閉じました");
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        // 指を離す前に長押しを発火させる。押しっぱなしのまま結果が分かるように。
+        let due: Vec<u8> = held
+            .iter()
+            .filter(|(_, (t, fired))| !fired && t.elapsed() >= LONG_PRESS)
+            .map(|(n, _)| *n)
+            .collect();
+        for note in due {
+            if let Some(entry) = held.get_mut(&note) {
+                entry.1 = true;
+            }
+            let Some(col) = status_column(note) else { continue };
+            let Some(Some(ws)) = fleet.columns.get(col) else { continue };
+            let Some(pane) = fleet.pane_of(ws) else {
+                eprintln!("col {col}: エージェントのいるペインがありません");
+                continue;
+            };
+            flash(&mut surface, note, &fleet);
+            if let Err(e) = herdr::request(
+                "pane.zoom",
+                json!({ "pane_id": pane, "mode": "toggle" }),
+            ) {
+                eprintln!("pane.zoom に失敗: {e}");
+            }
         }
     }
     Ok(())
